@@ -222,6 +222,8 @@ FS_RX_MODE = 0b100
 RX_MODE = 0b101
 # pylint: enable=bad-whitespace
 
+ACK = 0x80
+
 
 # Disable the too many instance members warning.  Pylint has no knowledge
 # of the context and is merely guessing at the proper amount of members.  This
@@ -331,29 +333,38 @@ class RFM9x:
 
     bw_bins = (7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000)
 
-    def __init__(self, spi, cs, reset, frequency, *, preamble_length=8,
-                 high_power=True, baudrate=5000000):
+    def __init__(self, spi, cs, reset, interruptPin, frequency, *, preamble_length=8,
+                 high_power=True, verbose=False):
         self.high_power = high_power
         self.thisAddress = _RH_BROADCAST_ADDRESS
         # Device support SPI mode 0 (polarity & phase = 0) up to a max of 10mhz.
         # Set Default Baudrate to 5MHz to avoid problems
-        self.spi = SPI(spi, baudrate=baudrate, polarity=0,
-                       phase=0, sck=Pin(18), mosi=Pin(23), miso=Pin(19))
-        self.chip_select = Pin(cs, Pin.OUT)
+        self.spi = spi
+        self.chip_select = cs
         self.chip_select.on()
 
         # Setup reset as a digital input (default state for reset line according
         # to the datasheet).  This line is pulled low as an output quickly to
         # trigger a reset.  Note that reset MUST be done like this and set as
         # a high impedence input or else the chip cannot change modes (trust me!).
-        self._reset = Pin(reset, Pin.OUT)
+        self._reset = reset
         self._reset.on()
         self.reset()
+
+        self.D0_pin = interruptPin
+        self.D0_pin.irq(trigger=Pin.IRQ_RISING, handler=self.handleInterrupt)
+
+        self._rxBuffer = None
+        self.rxValidBuffer = False
+        self.ID = 0
+        self.lastRSSI = 0.0
+        self.verbose = verbose
 
         # No device type check!  Catch an error from the very first request and
         # throw a nicer message to indicate possible wiring problems.
         version = self._read_u8(_RH_RF95_REG_42_VERSION)
-        print("version:", version)
+        if self.verbose:
+            print("version:", version)
         if version != 18:
             raise RuntimeError(
                 'Failed to find rfm9x with expected version -- check wiring')
@@ -389,16 +400,54 @@ class RFM9x:
         # Set TX power to low defaut, 13 dB.
         self.tx_power = 13
 
+    def handleInterrupt(self, pin):
+        if self.operation_mode == RX_MODE and self.rx_done:
+            if self.enable_crc and self.crc_error:
+                print("CRC error, packet ignored")
+                self.rxValidBuffer = False
+            else:
+                # Have received a packet
+                length = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
+                if length < 4:
+                    self.rxValidBuffer = False
+                else:
+                    # Have a good packet, grab it from the FIFO.
+                    # Reset the fifo read ptr to the beginning of the packet.
+                    current_addr = self._read_u8(
+                        _RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR)
+                    self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
+                    # Read the packet.
+                    buffer = self._read_into(
+                        _RH_RF95_REG_00_FIFO, length)
+                    if self.verbose:
+                        print("new to: ",
+                              buffer[0], " from: ", buffer[1])
+                    if (self.thisAddress == _RH_BROADCAST_ADDRESS or buffer[0] == _RH_BROADCAST_ADDRESS
+                            or buffer[0] == self.thisAddress):
+                        if self.verbose:
+                            print("Valid buffer")
+                        self._rxBuffer = buffer
+                        self.rxValidBuffer = True
+                        self.lastRSSI = self.rssi
+                    else:
+                        self.rxValidBuffer = False
+        # Clear interrupt.
+        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+
+    def clearBuffer(self):
+        self._rxBuffer = None
+        self.rxValidBuffer = False
+
     # pylint: disable=no-member
     # Reconsider pylint: disable when this can be tested
+
     def _read_into(self, address, length=None):
         # Read a number of bytes from the specified address into the provided
         # buffer.  If length is not specified (the default) the entire buffer
         # will be filled.
         self.chip_select.off()
         if length is None:
-            length = len(buf)
-        print("len: ", length)
+            length = len(252)
         addr = bytearray(1)
         buf = bytearray(length)
         addr[0] = address & 0x7F  # Strip out top bit to set 0
@@ -522,7 +571,7 @@ class RFM9x:
         return self.thisAddress
 
     @address.setter
-    def adress(self, val):
+    def address(self, val):
         if val >= 1 and val < 255:
             self.thisAddress = val
 
@@ -666,10 +715,10 @@ class RFM9x:
     def send_to(self, data, timeout=2000, toAddress=None):
         if not toAddress:
             toAddress = _RH_BROADCAST_ADDRESS
-        tx_header = (toAddress, self.thisAddress, 0, 0)
-        self.send(data=data, timeout=timeout, tx_header=tx_header)
+        tx_header = (toAddress, self.thisAddress, self.ID, 0)
+        self._send(data=data, timeout=timeout, tx_header=tx_header)
 
-    def send(self, data, timeout=2000, tx_header=(_RH_BROADCAST_ADDRESS, _RH_BROADCAST_ADDRESS, 0, 0)):
+    def _send(self, data, timeout=2000, tx_header=(_RH_BROADCAST_ADDRESS, _RH_BROADCAST_ADDRESS, 0, 0)):
         """Send a string of data using the transmitter.
            You can only send 252 bytes at a time
            (limited by chip's FIFO size and appended headers).
@@ -714,121 +763,44 @@ class RFM9x:
         self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
         if timed_out:
             raise RuntimeError('Timeout during packet send')
+        self.ID = self.ID + 1
 
-    """
-    // C++ level interrupt handler for this instance
-    // LORA is unusual in that it has several interrupt lines, and not a single,
-    // combined one. On MiniWirelessLoRa, only one of the several interrupt lines
-    // (DI0) from the RFM95 is usefuly connnected to the processor. We use this to
-    // get RxDone and TxDone interrupts
-    void RH_RF95::handleInterrupt() {
-      // Read the interrupt register
-      uint8_t irq_flags = spiRead(RH_RF95_REG_12_IRQ_FLAGS);
-      if (_mode == RHModeRx &&
-          irq_flags & (RH_RF95_RX_TIMEOUT | RH_RF95_PAYLOAD_CRC_ERROR)) {
-        _rxBad++;
-      } else if (_mode == RHModeRx && irq_flags & RH_RF95_RX_DONE) {
-        // Have received a packet
-        uint8_t len = spiRead(RH_RF95_REG_13_RX_NB_BYTES);
+    def available(self):
+        if self.operation_mode == TX_MODE:
+            return False
+        self.listen()
+        if self.rxValidBuffer:
+            return True
 
-        // Reset the fifo read ptr to the beginning of the packet
-        spiWrite(RH_RF95_REG_0D_FIFO_ADDR_PTR,
-                 spiRead(RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR));
-        spiBurstRead(RH_RF95_REG_00_FIFO, _buf, len);
-        _bufLen = len;
-        spiWrite(RH_RF95_REG_12_IRQ_FLAGS, 0xff); // Clear all IRQ flags
+    def receive(self, timeout=500, keep_listening=True, with_header=True, ack=True):
+        # get packet data
+        packet = self._receive(
+            timeout=timeout, keep_listening=False, with_header=True)
+        if not packet:
+            return None
+        # extract header for ack
+        if ack:
+            header_to = packet[1]
+            self.ID = packet[2]
+            header_flag = ACK
+            data = bytearray('!')
+            if self.verbose:
+                print("Send ACK: to: ", header_to, " from: ", self.thisAddress, " id: ",
+                      self.ID, " flag: ", hex(header_flag))
+            self._send(data, timeout=500, tx_header=(
+                header_to, self.thisAddress, self.ID, header_flag))
 
-        // Remember the last signal to noise ratio, LORA mode
-        // Per page 111, SX1276/77/78/79 datasheet
-        _lastSNR = (int8_t)spiRead(RH_RF95_REG_19_PKT_SNR_VALUE) / 4;
+        if not with_header:  # skip the header if not wanted
+            packet = packet[4:]
+        # Listen again if necessary and return the result packet.
+        if keep_listening:
+            self.listen()
+        else:
+            # Enter idle mode to stop receiving other packets.
+            self.idle()
+        return packet
 
-        // Remember the RSSI of this packet, LORA mode
-        // this is according to the doc, but is it really correct?
-        // weakest receiveable signals are reported RSSI at about -66
-        _lastRssi = spiRead(RH_RF95_REG_1A_PKT_RSSI_VALUE);
-        // Adjust the RSSI, datasheet page 87
-        if (_lastSNR < 0)
-          _lastRssi = _lastRssi + _lastSNR;
-        else
-          _lastRssi = (int)_lastRssi * 16 / 15;
-        if (_usingHFport)
-          _lastRssi -= 157;
-        else
-          _lastRssi -= 164;
-
-        // We have received a message.
-        validateRxBuf();
-        if (_rxBufValid)
-          setModeIdle(); // Got one
-      } else if (_mode == RHModeTx && irq_flags & RH_RF95_TX_DONE) {
-        _txGood++;
-        setModeIdle();
-      } else if (_mode == RHModeCad && irq_flags & RH_RF95_CAD_DONE) {
-        _cad = irq_flags & RH_RF95_CAD_DETECTED;
-        setModeIdle();
-      }
-      // Sigh: on some processors, for some unknown reason, doing this only once
-      // does not actually clear the radio's interrupt flag. So we do it twice. Why?
-      spiWrite(RH_RF95_REG_12_IRQ_FLAGS, 0xff); // Clear all IRQ flags
-      spiWrite(RH_RF95_REG_12_IRQ_FLAGS, 0xff); // Clear all IRQ flags
-    }
-
-    // Check whether the latest received message is complete and uncorrupted
-    void RH_RF95::validateRxBuf() {
-      if (_bufLen < 4)
-        return; // Too short to be a real message
-      // Extract the 4 headers
-      _rxHeaderTo = _buf[0];
-      _rxHeaderFrom = _buf[1];
-      _rxHeaderId = _buf[2];
-      _rxHeaderFlags = _buf[3];
-      if (_promiscuous || _rxHeaderTo == _thisAddress ||
-          _rxHeaderTo == RH_BROADCAST_ADDRESS) {
-        _rxGood++;
-        _rxBufValid = true;
-      }
-    }
-
-    bool RH_RF95::available() {
-      if (_mode == RHModeTx)
-        return false;
-      setModeRx();
-      return _rxBufValid; // Will be set by the interrupt handler when a good
-                          // message is received
-    }
-
-    void RH_RF95::clearRxBuf() {
-      ATOMIC_BLOCK_START;
-      _rxBufValid = false;
-      _bufLen = 0;
-      ATOMIC_BLOCK_END;
-    }
-
-    bool RH_RF95::recv(uint8_t *buf, uint8_t *len) {
-      if (!available())
-        return false;
-      if (buf && len) {
-        ATOMIC_BLOCK_START;
-        // Skip the 4 headers that are at the beginning of the rxBuf
-        if (*len > _bufLen - RH_RF95_HEADER_LEN)
-          *len = _bufLen - RH_RF95_HEADER_LEN;
-        memcpy(buf, _buf + RH_RF95_HEADER_LEN, *len);
-        ATOMIC_BLOCK_END;
-      }
-      clearRxBuf(); // This message accepted and cleared
-      return true;
-    }
-    """
-
-    def receive_from(self, timeout=500, keep_listening=True, with_header=False, address=None):
-        if not address:
-            address = _RH_BROADCAST_ADDRESS
-
-        self.receive(timeout=timeout, keep_listening=keep_listening, with_header=with_header,
-                     rx_filter=address)
-
-    def receive(self, timeout=500, keep_listening=True, with_header=False,
-                rx_filter=_RH_BROADCAST_ADDRESS):
+    def _receive(self, timeout=500, keep_listening=True, with_header=True):
         """Wait to receive a packet from the receiver. Will wait for up to timeout_s amount of
            seconds for a packet to be received and decoded. If a packet is found the payload bytes
            are returned, otherwise None is returned (which indicates the timeout elapsed with no
@@ -849,41 +821,20 @@ class RFM9x:
            If rx_filter is not 0xff and packet[0] does not match rx_filter then
            the packet is ignored and None is returned.
         """
-        # Make sure we are listening for packets.
-        self.listen()
-        # Wait for the rx done interrupt.  This is not ideal and will
-        # surely miss or overflow the FIFO when packets aren't read fast
-        # enough, however it's the best that can be done from Python without
-        # interrupt supports.
         start = time.ticks_ms()
-        timed_out = False
-        while not timed_out and not self.rx_done:
+        # time out
+        while self.available() == False:
             if time.ticks_diff(time.ticks_ms(), start) >= timeout:
-                timed_out = True
+                self.clearBuffer()
+                print("Timeout")
+                return None
         # Payload ready is set, a packet is in the FIFO.
-        packet = None
-        if not timed_out:
-            if self.enable_crc and self.crc_error:
-                warn("CRC error, packet ignored")
-            else:
-                # Grab the length of the received packet and check it has at least 5
-                # bytes to indicate the 4 byte header and at least 1 byte of user data.
-                length = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
-                if length < 5:
-                    packet = None
-                else:
-                    # Have a good packet, grab it from the FIFO.
-                    # Reset the fifo read ptr to the beginning of the packet.
-                    current_addr = self._read_u8(
-                        _RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR)
-                    self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
-                    # Read the packet.
-                    packet = self._read_into(_RH_RF95_REG_00_FIFO, length)
-                    if (rx_filter != _RH_BROADCAST_ADDRESS and packet[0] != _RH_BROADCAST_ADDRESS
-                            and packet[0] != rx_filter):
-                        packet = None
-                    elif not with_header:  # skip the header if not wanted
-                        packet = packet[4:]
+        packet = self._rxBuffer
+        if self.verbose:
+            print("header: ", packet[0], "-", packet[1],
+                  "-", packet[2], "-", packet[3])
+        if not with_header:  # skip the header if not wanted
+            packet = packet[4:]
         # Listen again if necessary and return the result packet.
         if keep_listening:
             self.listen()
@@ -892,4 +843,5 @@ class RFM9x:
             self.idle()
         # Clear interrupt.
         self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+        self.clearBuffer()
         return packet
