@@ -29,6 +29,7 @@ http: www.airspayce.com/mikem/arduino/RadioHead/
 import time
 from machine import Pin, SPI
 from micropython import const
+from random import *
 
 
 __version__ = "0.0.0-auto.0"
@@ -363,6 +364,10 @@ class RFM9x:
         self.ID = 0
         self.lastRSSI = 0.0
         self.verbose = verbose
+        self.rxBad = 0
+        self.rxGood = 0
+        self.txBad = 0
+        self.txGood = 0
 
         # No device type check!  Catch an error from the very first request and
         # throw a nicer message to indicate possible wiring problems.
@@ -409,6 +414,7 @@ class RFM9x:
             if self.enable_crc and self.crc_error:
                 print("CRC error, packet ignored")
                 self.rxValidBuffer = False
+                self.rxBad = self.rxBad + 1
             else:
                 # Have received a packet
                 length = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
@@ -425,7 +431,7 @@ class RFM9x:
                         _RH_RF95_REG_00_FIFO, length)
                     if self.verbose:
                         print("new to: ",
-                              buffer[0], " from: ", buffer[1])
+                              buffer[0], " from: ", buffer[1], " id: ", buffer[2], " flag: ", hex(buffer[3]))
                     if (self.thisAddress == _RH_BROADCAST_ADDRESS or buffer[0] == _RH_BROADCAST_ADDRESS
                             or buffer[0] == self.thisAddress):
                         if self.verbose:
@@ -433,14 +439,28 @@ class RFM9x:
                         self._rxBuffer = buffer
                         self.rxValidBuffer = True
                         self.lastRSSI = self.rssi
+                        self.rxGood = self.rxGood + 1
                     else:
                         self.rxValidBuffer = False
+                self.idle()
+        elif self.operation_mode == TX_MODE and self.tx_done:
+            if self.verbose:
+                print("TX done")
+            self.txGood = self.txGood + 1
+            self.idle()
         # Clear interrupt.
+        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
         self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
 
     def clearBuffer(self):
         self._rxBuffer = None
         self.rxValidBuffer = False
+
+    def getOperationStat(self):
+        if self.verbose:
+            print("RX bad: ", self.rxBad, " Good: ", self.rxGood,
+                  "TX bad: ", self.txBad, " Good: ", self.txGood)
+        return (self.rxBad, self.rxGood, self.txBad, self.txGood)
 
     # pylint: disable=no-member
     # Reconsider pylint: disable when this can be tested
@@ -716,6 +736,14 @@ class RFM9x:
                 self._read_u8(_RH_RF95_REG_1E_MODEM_CONFIG2) & 0xfb
             )
 
+    def waitAvailableTimeout(self, timeout):
+        start = time.ticks_ms()
+        while time.ticks_diff(time.ticks_ms(), start) < timeout:
+            if self.available():
+                return True
+            else:
+                return False
+
     def send_to(self, data, timeout=1000, retries=5, toAddress=None, wait_ack=True):
         """
         tx_header[0])  # Header: To
@@ -734,22 +762,31 @@ class RFM9x:
                 print("Retries: ", loop, " headr ", tx_header)
             self._send(data=data, timeout=timeout, tx_header=tx_header)
             self.listen()
-            loop = loop + 1
             # Never wait for ACKS to broadcasts:
             if toAddress == _RH_BROADCAST_ADDRESS or wait_ack == False:
                 return True
             if self.verbose:
                 print("Wait ack")
-            rx_data = self.receive(
-                timeout=timeout*2, keep_listening=True, with_header=True, ack=False)
-            if self.verbose:
-                print(rx_data)
-            if rx_data:
-
-                if rx_data[1] == toAddress and rx_data[0] == self.thisAddress and rx_data[2] == self.id and rx_data[3] == ACK:
+            loop = loop + 1
+            rx_data = None
+            rand = random()
+            start = time.ticks_ms()
+            _timeout = timeout+(timeout*random())
+            timeleft = _timeout - time.ticks_diff(time.ticks_ms(), start)
+            while timeleft > 0 or rx_data:
+                timeleft = _timeout - time.ticks_diff(time.ticks_ms(), start)
+                if self.waitAvailableTimeout(timeleft):
+                    rx_data = self._receive(
+                        timeout=200, keep_listening=True, with_header=True)
                     if self.verbose:
-                        print("Send success!")
-                    return True
+                        print(rx_data)
+                    if not rx_data:
+                        continue
+                    if rx_data[1] == toAddress and rx_data[0] == self.thisAddress and rx_data[2] == self.ID and rx_data[3] == ACK:
+                        if self.verbose:
+                            print("Send success!")
+                        return True
+        return False
 
     def _send(self, data, timeout=2000, tx_header=(_RH_BROADCAST_ADDRESS, _RH_BROADCAST_ADDRESS, 0, 0)):
         """Send a string of data using t2he transmitter.
@@ -764,13 +801,9 @@ class RFM9x:
             if self.verbose:
                 print("Payload too big")
                 return False
-        assert len(tx_header) == 4, "tx header must be 4-tuple (To,From,ID,Flags)"
 
-        self.idle()  # Stop receiving to clear FIFO and keep it clear.
-        # Fill the FIFO with a packet to send.
-        # FIFO starts at 0.
+        self.idle()
         self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, 0x00)
-        # Write header bytes.
         self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[0])  # Header: To
         self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[1])  # Header: From
         self._write_u8(_RH_RF95_REG_00_FIFO, tx_header[2])  # Header: Id
@@ -778,8 +811,10 @@ class RFM9x:
         # Write payload.
         self._write_from(_RH_RF95_REG_00_FIFO, data)
         # Write payload and header length.
-        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(data) + 4)
+        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH,
+                       len(data) + _RH_RF95_HEADER_LEN)
         # Turn on transmit mode to send out the packet.
+
         if self.verbose:
             print("Start trasmission")
         self.transmit()
@@ -789,16 +824,7 @@ class RFM9x:
             print(self.tx_done)
         timed_out = False
         start = time.ticks_ms()
-        while not self.tx_done and not timed_out:
-            if time.ticks_diff(time.ticks_ms(), start) >= timeout:
-                timed_out = True
-        if timed_out:
-            if self.verbose:
-                print("send timeout")
-            return False
-        self.idle()
-        # Clear interrupts.
-        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+
         return True
 
     def available(self):
